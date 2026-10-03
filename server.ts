@@ -1,0 +1,159 @@
+import { basename, dirname } from "node:path";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+import { hostContract, worktreeSchema, type Worktree } from "./contract.js";
+
+const worktreeRowSchema = worktreeSchema.extend({
+  session: z.string(),
+  running: z.boolean(),
+  url: z.string().nullable(),
+});
+export type WorktreeRow = z.infer<typeof worktreeRowSchema>;
+
+const projectRowSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  error: z.string().nullable(),
+  worktrees: z.array(worktreeRowSchema),
+});
+export type ProjectRow = z.infer<typeof projectRowSchema>;
+
+const target = z.object({ projectId: z.string(), path: z.string() });
+
+export const rpcContract = defineRpcContract({
+  overview: {
+    input: z.null(),
+    output: z.object({ projects: z.array(projectRowSchema) }),
+  },
+  start: { input: target, output: z.null() },
+  stop: { input: target, output: z.null() },
+  logs: {
+    input: target,
+    output: z.object({ text: z.string() }),
+  },
+});
+
+const LOG_LINES = 400;
+const URL_PATTERN = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d+/;
+
+/** tmux names can't hold "." or ":"; bb's own worktrees all end in the repo
+ * name, so those borrow their parent folder to stay unique. */
+function sessionName(repoPath: string, path: string): string {
+  const name =
+    path !== repoPath && basename(path) === basename(repoPath)
+      ? `${basename(dirname(path))}-${basename(path)}`
+      : basename(path);
+  return name.replace(/[^A-Za-z0-9_-]+/g, "-");
+}
+
+export default async function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    devCommand: {
+      type: "string",
+      label: "Dev command",
+      description: "Typed into the worktree's tmux session by Start.",
+      default: "pnpm dev",
+    },
+  });
+  const host = bb.hosts.experimental_client({ contract: hostContract });
+
+  async function projectSource(projectId: string) {
+    const project = await bb.sdk.projects.get({ projectId });
+    const source =
+      project.sources.find((candidate) => candidate.isDefault) ??
+      project.sources[0];
+    if (!source) throw new Error(`${project.name} has no local source`);
+    return { project, hostId: source.hostId, repoPath: source.path };
+  }
+
+  async function listWorktrees(hostId: string, repoPath: string) {
+    const { worktrees } = await host.call(
+      "worktrees",
+      { repoPath },
+      { hostId },
+    );
+    return worktrees;
+  }
+
+  /** Only paths git reports for this project are ever handed to tmux. */
+  async function resolve(projectId: string, path: string) {
+    const { hostId, repoPath } = await projectSource(projectId);
+    const worktree = (await listWorktrees(hostId, repoPath)).find(
+      (candidate) => candidate.path === path,
+    );
+    if (!worktree) throw new Error(`${path} is not a worktree of this project`);
+    return { hostId, path, session: sessionName(repoPath, path) };
+  }
+
+  async function detectUrl(hostId: string, session: string) {
+    const capture = await host
+      .call("capture", { session, lines: 2000 }, { hostId })
+      .catch(() => null);
+    return capture?.text.match(URL_PATTERN)?.[0] ?? null;
+  }
+
+  async function projectRow(projectId: string): Promise<ProjectRow> {
+    const { project, hostId, repoPath } = await projectSource(projectId);
+    const [worktrees, { sessions }] = await Promise.all([
+      listWorktrees(hostId, repoPath),
+      host.call("sessions", null, { hostId }),
+    ]);
+    const running = new Set(sessions);
+    const rows = await Promise.all(
+      worktrees.map(async (worktree: Worktree) => {
+        const session = sessionName(repoPath, worktree.path);
+        const isRunning = running.has(session);
+        return {
+          ...worktree,
+          session,
+          running: isRunning,
+          url: isRunning ? await detectUrl(hostId, session) : null,
+        };
+      }),
+    );
+    rows.sort(
+      (a, b) =>
+        Number(b.path === repoPath) - Number(a.path === repoPath) ||
+        Number(b.running) - Number(a.running) ||
+        a.path.localeCompare(b.path),
+    );
+    return { id: project.id, name: project.name, error: null, worktrees: rows };
+  }
+
+  bb.rpc.register(rpcContract, {
+    overview: async () => {
+      const projects = await bb.sdk.projects.list();
+      return {
+        projects: await Promise.all(
+          projects.map((project) =>
+            projectRow(project.id).catch(
+              (cause: unknown): ProjectRow => ({
+                id: project.id,
+                name: project.name,
+                error: cause instanceof Error ? cause.message : String(cause),
+                worktrees: [],
+              }),
+            ),
+          ),
+        ),
+      };
+    },
+    start: async ({ projectId, path }) => {
+      const { hostId, session } = await resolve(projectId, path);
+      const { devCommand } = await settings.get();
+      return host.call(
+        "start",
+        { session, cwd: path, command: devCommand },
+        { hostId },
+      );
+    },
+    stop: async ({ projectId, path }) => {
+      const { hostId, session } = await resolve(projectId, path);
+      return host.call("stop", { session }, { hostId });
+    },
+    logs: async ({ projectId, path }) => {
+      const { hostId, session } = await resolve(projectId, path);
+      return host.call("capture", { session, lines: LOG_LINES }, { hostId });
+    },
+  });
+}
