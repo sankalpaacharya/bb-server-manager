@@ -34,8 +34,10 @@ const messageOf = (cause: unknown) =>
 
 const displayPath = (path: string) => path.replace(/^\/home\/[^/]+/, "~");
 
+/** Detached worktrees share a commit, so their folder is what tells them apart. */
 const label = (worktree: WorktreeRow) =>
-  worktree.branch ?? `Detached at ${worktree.head}`;
+  worktree.branch ??
+  `${worktree.path.split("/").at(-1)} (detached at ${worktree.head})`;
 
 function usePolling(callback: () => void, intervalMs: number) {
   useEffect(() => {
@@ -287,95 +289,161 @@ function RunningRow({
 
 type RemovalCheck = { blocked: string | null; changes: number; usedByBb: boolean };
 
-function DeleteWorktreeDialog({
+const plural = (count: number, one: string, many: string) =>
+  `${count} ${count === 1 ? one : many}`;
+
+function removalStatus(worktree: WorktreeRow, check: RemovalCheck) {
+  if (check.blocked) return { text: check.blocked, tone: "muted" as const };
+  if (check.changes > 0) {
+    return {
+      text: `${plural(check.changes, "uncommitted change", "uncommitted changes")} will be lost`,
+      tone: "danger" as const,
+    };
+  }
+  if (!worktree.branch) {
+    return { text: "Not on a branch", tone: "muted" as const };
+  }
+  return { text: "Clean", tone: "muted" as const };
+}
+
+function DeleteWorktreesDialog({
   projectId,
-  worktree,
-  open,
-  onOpenChange,
+  worktrees,
+  onClose,
   onDeleted,
 }: {
   projectId: string;
-  worktree: WorktreeRow;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+  worktrees: WorktreeRow[];
+  onClose: () => void;
   onDeleted: () => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [check, setCheck] = useState<RemovalCheck | null>(null);
+  const [checks, setChecks] = useState<Map<string, RemovalCheck> | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState(false);
+  const [progress, setProgress] = useState<number | null>(null);
   useEffect(() => {
-    if (!open) return;
-    setCheck(null);
-    setError(null);
-    rpc.call("checkRemove", { projectId, path: worktree.path }).then(
-      setCheck,
+    Promise.all(
+      worktrees.map(
+        async (worktree) =>
+          [
+            worktree.path,
+            await rpc.call("checkRemove", { projectId, path: worktree.path }),
+          ] as const,
+      ),
+    ).then(
+      (entries) => setChecks(new Map(entries)),
       (cause) => setError(messageOf(cause)),
     );
-  }, [open, rpc, projectId, worktree.path]);
+  }, [rpc, projectId, worktrees]);
+  const deletable = checks
+    ? worktrees.filter((worktree) => !checks.get(worktree.path)?.blocked)
+    : [];
+  const withChanges = deletable.filter(
+    (worktree) => (checks?.get(worktree.path)?.changes ?? 0) > 0,
+  );
+  const usedByBb = deletable.some((worktree) => checks?.get(worktree.path)?.usedByBb);
   const remove = async () => {
-    if (!check) return;
-    setDeleting(true);
-    try {
-      await rpc.call("remove", {
-        projectId,
-        path: worktree.path,
-        force: check.changes > 0,
-      });
-      toast.success(`Deleted ${displayPath(worktree.path)}`);
-      onOpenChange(false);
-      onDeleted();
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setDeleting(false);
+    const failures: string[] = [];
+    for (const [index, worktree] of deletable.entries()) {
+      setProgress(index + 1);
+      try {
+        await rpc.call("remove", {
+          projectId,
+          path: worktree.path,
+          force: (checks?.get(worktree.path)?.changes ?? 0) > 0,
+        });
+      } catch (cause) {
+        failures.push(`${label(worktree)}: ${messageOf(cause)}`);
+      }
     }
+    const removed = deletable.length - failures.length;
+    if (removed > 0) toast.success(`Deleted ${plural(removed, "worktree", "worktrees")}`);
+    for (const failure of failures) toast.error(failure);
+    onDeleted();
+    onClose();
   };
-  const canDelete = check !== null && check.blocked === null && !error;
+  const single = worktrees.length === 1;
+  const skipped = worktrees.length - deletable.length;
+  const detached = deletable.some((worktree) => !worktree.branch);
+  const title =
+    checks === null
+      ? single
+        ? "Delete this worktree?"
+        : `Delete ${worktrees.length} worktrees?`
+      : deletable.length === 0
+        ? single
+          ? "Can't delete this worktree"
+          : "None of these can be deleted"
+        : deletable.length === 1
+          ? "Delete this worktree?"
+          : `Delete ${deletable.length} worktrees?`;
+  const action =
+    progress !== null
+      ? `Deleting ${progress} of ${deletable.length}…`
+      : withChanges.length > 0
+        ? `Delete ${deletable.length === 1 ? "" : `${deletable.length} `}with changes`
+        : single
+          ? "Delete worktree"
+          : `Delete ${plural(deletable.length, "worktree", "worktrees")}`;
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
+    <AlertDialog open onOpenChange={(open) => (open ? null : onClose())}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>
-            {check?.blocked ? "Can't delete this worktree" : "Delete this worktree?"}
-          </AlertDialogTitle>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription asChild>
             <div className="space-y-3 text-sm text-muted-foreground">
               {error ? (
                 <p className="text-destructive">{error}</p>
-              ) : check === null ? (
+              ) : checks === null ? (
                 <p>Checking for uncommitted changes…</p>
-              ) : check.blocked ? (
-                <p>{check.blocked}</p>
               ) : (
                 <>
-                  <p>
-                    The folder{" "}
-                    <code className="text-foreground">
-                      {displayPath(worktree.path)}
-                    </code>{" "}
-                    will be removed from disk.{" "}
-                    {worktree.branch ? (
-                      <>
-                        The branch{" "}
-                        <code className="text-foreground">{worktree.branch}</code>{" "}
-                        stays, so its commits are safe.
-                      </>
-                    ) : (
-                      "It isn't on a branch, so commits made only here may be lost."
-                    )}
-                  </p>
-                  {check.changes > 0 ? (
-                    <p className="text-destructive">
-                      It has {check.changes} uncommitted{" "}
-                      {check.changes === 1 ? "change" : "changes"}. Deleting
-                      throws {check.changes === 1 ? "it" : "them"} away.
-                    </p>
-                  ) : null}
-                  {check.usedByBb ? (
+                  <ul className="max-h-64 divide-y divide-border overflow-y-auto rounded-md border border-border">
+                    {worktrees.map((worktree) => {
+                      const check = checks.get(worktree.path);
+                      const status = check ? removalStatus(worktree, check) : null;
+                      return (
+                        <li key={worktree.path} className="px-3 py-2">
+                          <div
+                            className={cn(
+                              "truncate",
+                              !check?.blocked && "text-foreground",
+                            )}
+                          >
+                            {label(worktree)}
+                          </div>
+                          <div className="flex justify-between gap-3 text-xs">
+                            <span className="truncate">
+                              {displayPath(worktree.path)}
+                            </span>
+                            {status ? (
+                              <span
+                                className={cn(
+                                  "shrink-0",
+                                  status.tone === "danger" && "text-destructive",
+                                )}
+                              >
+                                {status.text}
+                              </span>
+                            ) : null}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {deletable.length > 0 ? (
                     <p>
-                      A bb thread has worked in this folder. That thread
-                      won't be able to open it anymore.
+                      {deletable.length === 1 ? "The folder is" : "Folders are"}{" "}
+                      removed from disk.{" "}
+                      {detached
+                        ? "Commits on a branch stay safe, but commits made only in a detached worktree may be lost."
+                        : "Branches stay, so their commits are safe."}
+                      {skipped > 0
+                        ? ` ${plural(skipped, "worktree is", "worktrees are")} skipped.`
+                        : null}
+                      {usedByBb
+                        ? " bb threads that worked in these folders won't be able to open them anymore."
+                        : null}
                     </p>
                   ) : null}
                 </>
@@ -384,21 +452,19 @@ function DeleteWorktreeDialog({
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>{canDelete ? "Cancel" : "Close"}</AlertDialogCancel>
-          {canDelete ? (
+          <AlertDialogCancel disabled={progress !== null}>
+            {deletable.length > 0 ? "Cancel" : "Close"}
+          </AlertDialogCancel>
+          {deletable.length > 0 && !error ? (
             <AlertDialogAction
               className={buttonVariants({ variant: "destructive" })}
-              disabled={deleting}
+              disabled={progress !== null}
               onClick={(event) => {
                 event.preventDefault();
                 void remove();
               }}
             >
-              {deleting
-                ? "Deleting…"
-                : check.changes > 0
-                  ? "Delete with changes"
-                  : "Delete worktree"}
+              {action}
             </AlertDialogAction>
           ) : null}
         </AlertDialogFooter>
@@ -410,23 +476,44 @@ function DeleteWorktreeDialog({
 function StoppedRow({
   projectId,
   worktree,
+  selected,
+  selecting,
+  onSelect,
   onStarted,
-  onDeleted,
+  onDelete,
 }: {
   projectId: string;
   worktree: WorktreeRow;
+  selected: boolean;
+  selecting: boolean;
+  onSelect: (selected: boolean, range: boolean) => void;
   onStarted: () => void;
-  onDeleted: () => void;
+  onDelete: () => void;
 }) {
   const { pending, run } = useServerAction(projectId, worktree, onStarted);
-  const [confirming, setConfirming] = useState(false);
   const reveal =
     "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100";
   return (
     <li
-      className="group flex h-10 items-center gap-3 pl-4 pr-2 hover:bg-state-hover"
+      className={cn(
+        "group flex h-10 items-center gap-3 pl-3 pr-2 hover:bg-state-hover",
+        selected && "bg-state-active hover:bg-state-active",
+      )}
       title={displayPath(worktree.path)}
     >
+      <input
+        type="checkbox"
+        checked={selected}
+        aria-label={`Select ${label(worktree)}`}
+        onClick={(event) => {
+          onSelect(event.currentTarget.checked, event.shiftKey);
+        }}
+        onChange={() => undefined}
+        className={cn(
+          "size-4 shrink-0 cursor-pointer accent-foreground",
+          selecting || selected ? "opacity-100" : reveal,
+        )}
+      />
       <div className="min-w-0 flex-1">
         <BranchName worktree={worktree} />
       </div>
@@ -438,7 +525,7 @@ function StoppedRow({
             size="icon"
             className={cn("size-8 text-muted-foreground hover:text-destructive", reveal)}
             aria-label={`Delete worktree ${label(worktree)}`}
-            onClick={() => setConfirming(true)}
+            onClick={onDelete}
           >
             <Icon name="Trash2" />
           </Button>
@@ -454,15 +541,6 @@ function StoppedRow({
           {pending === "start" ? "Starting" : "Start"}
         </Button>
       </div>
-      {worktree.primary ? null : (
-        <DeleteWorktreeDialog
-          projectId={projectId}
-          worktree={worktree}
-          open={confirming}
-          onOpenChange={setConfirming}
-          onDeleted={onDeleted}
-        />
-      )}
     </li>
   );
 }
@@ -470,15 +548,18 @@ function StoppedRow({
 function Group({
   title,
   count,
+  control,
   children,
 }: {
   title: string;
   count: number;
+  control?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <section className="space-y-2">
-      <h2 className="flex items-baseline gap-2 text-sm font-medium">
+      <h2 className="flex items-center gap-2 pl-3 text-sm font-medium">
+        {control}
         {title}
         <span className="text-muted-foreground">{count}</span>
       </h2>
@@ -486,6 +567,81 @@ function Group({
         {children}
       </ul>
     </section>
+  );
+}
+
+function SelectAll({
+  total,
+  chosen,
+  onChange,
+}: {
+  total: number;
+  chosen: number;
+  onChange: (all: boolean) => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = chosen > 0 && chosen < total;
+  }, [chosen, total]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={total > 0 && chosen === total}
+      aria-label="Select all stopped worktrees"
+      onChange={(event) => onChange(event.currentTarget.checked)}
+      className="size-4 cursor-pointer accent-foreground"
+    />
+  );
+}
+
+function SelectionBar({
+  count,
+  busy,
+  onStart,
+  onDelete,
+  onClear,
+}: {
+  count: number;
+  busy: string | null;
+  onStart: () => void;
+  onDelete: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="sticky bottom-4 z-10 flex justify-center">
+      <div
+        role="toolbar"
+        aria-label="Selected worktrees"
+        className="flex items-center gap-1 rounded-lg border border-border bg-popover py-1 pl-4 pr-1 text-sm shadow-lg"
+      >
+        <span className="mr-2 tabular-nums">{busy ?? `${count} selected`}</span>
+        <Button variant="ghost" size="sm" disabled={busy !== null} onClick={onStart}>
+          <Icon name="Play" />
+          Start
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="hover:text-destructive"
+          disabled={busy !== null}
+          onClick={onDelete}
+        >
+          <Icon name="Trash2" />
+          Delete
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 text-muted-foreground"
+          aria-label="Clear selection"
+          disabled={busy !== null}
+          onClick={onClear}
+        >
+          <Icon name="X" />
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -507,15 +663,29 @@ function WorktreeList({
   projectId: string;
   query: string;
 }) {
+  const rpc = useRpc<typeof rpcContract>();
   const { worktrees, error, refetch } = useWorktrees(projectId);
   const [openLogs, setOpenLogs] = useState<ReadonlySet<string>>(new Set());
-  const setLogsOpen = (path: string, open: boolean) =>
+  const [selection, setSelection] = useState<ReadonlySet<string>>(new Set());
+  const [deleting, setDeleting] = useState<WorktreeRow[] | null>(null);
+  const [bulkStart, setBulkStart] = useState<string | null>(null);
+  const anchor = useRef<number | null>(null);
+  const setLogsOpen = (paths: string[], open: boolean) =>
     setOpenLogs((current) => {
       const next = new Set(current);
-      if (open) next.add(path);
-      else next.delete(path);
+      for (const path of paths) {
+        if (open) next.add(path);
+        else next.delete(path);
+      }
       return next;
     });
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelection(new Set());
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   if (error) {
     return (
       <p role="alert" className="text-sm text-destructive">
@@ -535,6 +705,41 @@ function WorktreeList({
   }
   const running = visible.filter((worktree) => worktree.running);
   const stopped = visible.filter((worktree) => !worktree.running);
+  // Actions only ever touch rows that are on screen right now.
+  const chosen = stopped.filter((worktree) => selection.has(worktree.path));
+
+  const select = (index: number, value: boolean, range: boolean) => {
+    const from = range && anchor.current !== null ? anchor.current : index;
+    const [low, high] = from < index ? [from, index] : [index, from];
+    setSelection((current) => {
+      const next = new Set(current);
+      for (const worktree of stopped.slice(low, high + 1)) {
+        if (value) next.add(worktree.path);
+        else next.delete(worktree.path);
+      }
+      return next;
+    });
+    anchor.current = index;
+  };
+  const startChosen = async () => {
+    const targets = chosen;
+    const failures: string[] = [];
+    for (const [index, worktree] of targets.entries()) {
+      setBulkStart(`Starting ${index + 1} of ${targets.length}…`);
+      try {
+        await rpc.call("start", { projectId, path: worktree.path });
+      } catch (cause) {
+        failures.push(`${label(worktree)}: ${messageOf(cause)}`);
+      }
+    }
+    setBulkStart(null);
+    setSelection(new Set());
+    const started = targets.length - failures.length;
+    if (started > 0) toast.success(`Started ${plural(started, "dev server", "dev servers")}`);
+    for (const failure of failures) toast.error(failure);
+    refetch();
+  };
+
   return (
     <div className="space-y-6">
       {running.length > 0 ? (
@@ -546,7 +751,7 @@ function WorktreeList({
               worktree={worktree}
               showLogs={openLogs.has(worktree.path)}
               onToggleLogs={() =>
-                setLogsOpen(worktree.path, !openLogs.has(worktree.path))
+                setLogsOpen([worktree.path], !openLogs.has(worktree.path))
               }
               onChanged={refetch}
             />
@@ -554,20 +759,57 @@ function WorktreeList({
         </Group>
       ) : null}
       {stopped.length > 0 ? (
-        <Group title="Stopped" count={stopped.length}>
-          {stopped.map((worktree) => (
+        <Group
+          title="Stopped"
+          count={stopped.length}
+          control={
+            <SelectAll
+              total={stopped.length}
+              chosen={chosen.length}
+              onChange={(all) =>
+                setSelection(
+                  new Set(all ? stopped.map((worktree) => worktree.path) : []),
+                )
+              }
+            />
+          }
+        >
+          {stopped.map((worktree, index) => (
             <StoppedRow
               key={worktree.path}
               projectId={projectId}
               worktree={worktree}
+              selected={selection.has(worktree.path)}
+              selecting={chosen.length > 0}
+              onSelect={(value, range) => select(index, value, range)}
               onStarted={() => {
-                setLogsOpen(worktree.path, true);
+                setLogsOpen([worktree.path], true);
                 refetch();
               }}
-              onDeleted={refetch}
+              onDelete={() => setDeleting([worktree])}
             />
           ))}
         </Group>
+      ) : null}
+      {chosen.length > 0 ? (
+        <SelectionBar
+          count={chosen.length}
+          busy={bulkStart}
+          onStart={() => void startChosen()}
+          onDelete={() => setDeleting(chosen)}
+          onClear={() => setSelection(new Set())}
+        />
+      ) : null}
+      {deleting ? (
+        <DeleteWorktreesDialog
+          projectId={projectId}
+          worktrees={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={() => {
+            setSelection(new Set());
+            refetch();
+          }}
+        />
       ) : null}
     </div>
   );

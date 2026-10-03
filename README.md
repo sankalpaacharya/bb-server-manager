@@ -7,6 +7,7 @@ tmux session.
 - Worktrees are split into **Running** and **Stopped**. Each running server
   shows its latest output line as it changes.
 - The filter box narrows the list by branch or folder name.
+- Tick worktrees (shift-click for a range) to start or delete several at once.
 - **Start dev** opens a detached tmux session in the worktree and types the dev
   command (default `pnpm dev`). The pane is a normal shell, so it stays open
   if the server crashes.
