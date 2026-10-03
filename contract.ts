@@ -33,6 +33,18 @@ export const hostContract = defineRpcContract({
     input: sessionTarget,
     output: z.null(),
   },
+  changes: {
+    input: z.object({ path: z.string().min(1) }),
+    output: z.object({ count: z.number().int() }),
+  },
+  remove: {
+    input: z.object({
+      repoPath: z.string().min(1),
+      path: z.string().min(1),
+      force: z.boolean(),
+    }),
+    output: z.null(),
+  },
   capture: {
     input: sessionTarget.extend({ lines: z.number().int().min(1).max(5000) }),
     output: z.object({ text: z.string() }),

@@ -31,6 +31,19 @@ export const rpcContract = defineRpcContract({
     input: target,
     output: z.object({ text: z.string() }),
   },
+  checkRemove: {
+    input: target,
+    output: z.object({
+      /** Why this worktree can't be deleted here, or null when it can. */
+      blocked: z.string().nullable(),
+      changes: z.number().int(),
+      usedByBb: z.boolean(),
+    }),
+  },
+  remove: {
+    input: target.extend({ force: z.boolean() }),
+    output: z.null(),
+  },
 });
 
 const LOG_LINES = 400;
@@ -82,7 +95,29 @@ export default async function plugin(bb: BbPluginApi) {
       (candidate) => candidate.path === path,
     );
     if (!worktree) throw new Error(`${path} is not a worktree of this project`);
-    return { hostId, path, session: sessionName(repoPath, path) };
+    return { hostId, repoPath, path, session: sessionName(repoPath, path) };
+  }
+
+  /** Every reason deletion is unsafe is checked here, on each attempt. */
+  async function removal(projectId: string, path: string) {
+    const target = await resolve(projectId, path);
+    const [{ sessions }, environments, { count }] = await Promise.all([
+      host.call("sessions", null, { hostId: target.hostId }),
+      bb.sdk.environments.list({ projectId, path }),
+      host.call("changes", { path }, { hostId: target.hostId }),
+    ]);
+    const live = environments.filter(
+      (environment) => environment.lifecycle.phase !== "destroyed",
+    );
+    const blocked =
+      path === target.repoPath
+        ? "This is the main checkout, so it can't be deleted."
+        : sessions.includes(target.session)
+          ? "Stop its dev server first."
+          : live.some((environment) => environment.managed)
+            ? "A bb thread owns this worktree. Archive the thread to remove it."
+            : null;
+    return { target, blocked, changes: count, usedByBb: live.length > 0 };
   }
 
   async function peek(hostId: string, session: string) {
@@ -153,6 +188,24 @@ export default async function plugin(bb: BbPluginApi) {
     logs: async ({ projectId, path }) => {
       const { hostId, session } = await resolve(projectId, path);
       return host.call("capture", { session, lines: LOG_LINES }, { hostId });
+    },
+    checkRemove: async ({ projectId, path }) => {
+      const { blocked, changes, usedByBb } = await removal(projectId, path);
+      return { blocked, changes, usedByBb };
+    },
+    remove: async ({ projectId, path, force }) => {
+      const { target, blocked, changes } = await removal(projectId, path);
+      if (blocked) throw new Error(blocked);
+      if (changes > 0 && !force) {
+        throw new Error(
+          `${changes} uncommitted ${changes === 1 ? "change" : "changes"} would be lost`,
+        );
+      }
+      return host.call(
+        "remove",
+        { repoPath: target.repoPath, path, force },
+        { hostId: target.hostId },
+      );
     },
   });
 }

@@ -100,6 +100,18 @@ export default experimental_defineHostEntry({
       );
       return null;
     },
+    changes: async ({ path }, { signal }) => {
+      const out = await run("git", ["-C", path, "status", "--porcelain"], signal);
+      return { count: out.split("\n").filter(Boolean).length };
+    },
+    remove: async ({ repoPath, path, force }, { signal }) => {
+      await run(
+        "git",
+        ["-C", repoPath, "worktree", "remove", ...(force ? ["--force"] : []), path],
+        signal,
+      );
+      return null;
+    },
     capture: async ({ session, lines }, { signal }) => {
       const out = await run(
         "tmux",

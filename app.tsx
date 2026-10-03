@@ -3,7 +3,17 @@ import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { definePluginApp, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { WorktreeRow, rpcContract } from "./server";
-import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import {
   Select,
@@ -200,7 +210,7 @@ function BranchName({ worktree }: { worktree: WorktreeRow }) {
       </span>
       {worktree.primary ? (
         <span className="shrink-0 rounded border border-border px-1.5 text-[11px] leading-4 text-muted-foreground">
-          main
+          main checkout
         </span>
       ) : null}
     </span>
@@ -275,16 +285,143 @@ function RunningRow({
   );
 }
 
+type RemovalCheck = { blocked: string | null; changes: number; usedByBb: boolean };
+
+function DeleteWorktreeDialog({
+  projectId,
+  worktree,
+  open,
+  onOpenChange,
+  onDeleted,
+}: {
+  projectId: string;
+  worktree: WorktreeRow;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onDeleted: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [check, setCheck] = useState<RemovalCheck | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    setCheck(null);
+    setError(null);
+    rpc.call("checkRemove", { projectId, path: worktree.path }).then(
+      setCheck,
+      (cause) => setError(messageOf(cause)),
+    );
+  }, [open, rpc, projectId, worktree.path]);
+  const remove = async () => {
+    if (!check) return;
+    setDeleting(true);
+    try {
+      await rpc.call("remove", {
+        projectId,
+        path: worktree.path,
+        force: check.changes > 0,
+      });
+      toast.success(`Deleted ${displayPath(worktree.path)}`);
+      onOpenChange(false);
+      onDeleted();
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setDeleting(false);
+    }
+  };
+  const canDelete = check !== null && check.blocked === null && !error;
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>
+            {check?.blocked ? "Can't delete this worktree" : "Delete this worktree?"}
+          </AlertDialogTitle>
+          <AlertDialogDescription asChild>
+            <div className="space-y-3 text-sm text-muted-foreground">
+              {error ? (
+                <p className="text-destructive">{error}</p>
+              ) : check === null ? (
+                <p>Checking for uncommitted changes…</p>
+              ) : check.blocked ? (
+                <p>{check.blocked}</p>
+              ) : (
+                <>
+                  <p>
+                    The folder{" "}
+                    <code className="text-foreground">
+                      {displayPath(worktree.path)}
+                    </code>{" "}
+                    will be removed from disk.{" "}
+                    {worktree.branch ? (
+                      <>
+                        The branch{" "}
+                        <code className="text-foreground">{worktree.branch}</code>{" "}
+                        stays, so its commits are safe.
+                      </>
+                    ) : (
+                      "It isn't on a branch, so commits made only here may be lost."
+                    )}
+                  </p>
+                  {check.changes > 0 ? (
+                    <p className="text-destructive">
+                      It has {check.changes} uncommitted{" "}
+                      {check.changes === 1 ? "change" : "changes"}. Deleting
+                      throws {check.changes === 1 ? "it" : "them"} away.
+                    </p>
+                  ) : null}
+                  {check.usedByBb ? (
+                    <p>
+                      A bb thread has worked in this folder. That thread
+                      won't be able to open it anymore.
+                    </p>
+                  ) : null}
+                </>
+              )}
+            </div>
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>{canDelete ? "Cancel" : "Close"}</AlertDialogCancel>
+          {canDelete ? (
+            <AlertDialogAction
+              className={buttonVariants({ variant: "destructive" })}
+              disabled={deleting}
+              onClick={(event) => {
+                event.preventDefault();
+                void remove();
+              }}
+            >
+              {deleting
+                ? "Deleting…"
+                : check.changes > 0
+                  ? "Delete with changes"
+                  : "Delete worktree"}
+            </AlertDialogAction>
+          ) : null}
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
 function StoppedRow({
   projectId,
   worktree,
   onStarted,
+  onDeleted,
 }: {
   projectId: string;
   worktree: WorktreeRow;
   onStarted: () => void;
+  onDeleted: () => void;
 }) {
   const { pending, run } = useServerAction(projectId, worktree, onStarted);
+  const [confirming, setConfirming] = useState(false);
+  const reveal =
+    "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100";
   return (
     <li
       className="group flex h-10 items-center gap-3 pl-4 pr-2 hover:bg-state-hover"
@@ -294,16 +431,38 @@ function StoppedRow({
         <BranchName worktree={worktree} />
       </div>
       <Age worktree={worktree} />
-      <Button
-        variant="ghost"
-        size="sm"
-        className="w-20 justify-start text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-100 [@media(hover:none)]:opacity-100"
-        disabled={pending !== null}
-        onClick={() => run("start")}
-      >
-        <Icon name="Play" />
-        {pending === "start" ? "Starting" : "Start"}
-      </Button>
+      <div className="flex w-28 items-center justify-end gap-0.5">
+        {worktree.primary ? null : (
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn("size-8 text-muted-foreground hover:text-destructive", reveal)}
+            aria-label={`Delete worktree ${label(worktree)}`}
+            onClick={() => setConfirming(true)}
+          >
+            <Icon name="Trash2" />
+          </Button>
+        )}
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn("text-muted-foreground disabled:opacity-100", reveal)}
+          disabled={pending !== null}
+          onClick={() => run("start")}
+        >
+          <Icon name="Play" />
+          {pending === "start" ? "Starting" : "Start"}
+        </Button>
+      </div>
+      {worktree.primary ? null : (
+        <DeleteWorktreeDialog
+          projectId={projectId}
+          worktree={worktree}
+          open={confirming}
+          onOpenChange={setConfirming}
+          onDeleted={onDeleted}
+        />
+      )}
     </li>
   );
 }
@@ -405,6 +564,7 @@ function WorktreeList({
                 setLogsOpen(worktree.path, true);
                 refetch();
               }}
+              onDeleted={refetch}
             />
           ))}
         </Group>
