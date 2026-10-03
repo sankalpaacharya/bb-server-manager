@@ -87,11 +87,20 @@ function useServerAction(
   return { pending, run };
 }
 
-function LogView({ projectId, path }: { projectId: string; path: string }) {
+function LogView({
+  projectId,
+  path,
+  session,
+}: {
+  projectId: string;
+  path: string;
+  session: string;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const [text, setText] = useState<string | null>(null);
   const ref = useRef<HTMLPreElement>(null);
   const pinned = useRef(true);
+  const attach = `tmux attach -t ${session}`;
   const fetchLogs = useCallback(() => {
     rpc.call("logs", { projectId, path }).then(
       (result) => setText(result.text),
@@ -104,61 +113,97 @@ function LogView({ projectId, path }: { projectId: string; path: string }) {
     if (element && pinned.current) element.scrollTop = element.scrollHeight;
   }, [text]);
   return (
-    <pre
-      ref={ref}
-      tabIndex={0}
-      aria-label="Dev server output"
-      onScroll={(event) => {
-        const element = event.currentTarget;
-        pinned.current =
-          element.scrollHeight - element.scrollTop - element.clientHeight < 24;
-      }}
-      className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted/60 p-3 font-mono text-xs leading-relaxed text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-    >
-      {text ?? "Waiting for output…"}
-    </pre>
+    <div className="mt-3 overflow-hidden rounded-md border border-border">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+        <span className="truncate">
+          Open in a terminal with{" "}
+          <code className="text-foreground">{attach}</code>
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 shrink-0 px-2"
+          onClick={() => {
+            void navigator.clipboard.writeText(attach);
+            toast.success("Copied");
+          }}
+        >
+          <Icon name="Copy" />
+          Copy
+        </Button>
+      </div>
+      <pre
+        ref={ref}
+        tabIndex={0}
+        aria-label="Dev server output"
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          pinned.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight <
+            24;
+        }}
+        className="max-h-96 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere] bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
+      >
+        {text ?? "Waiting for output…"}
+      </pre>
+    </div>
   );
 }
 
-const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+const shortDate = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+});
 
-function age(ms: number): string {
-  const minutes = Math.round((ms - Date.now()) / 60_000);
-  if (minutes === 0) return "just now";
-  if (Math.abs(minutes) < 60) return relative.format(minutes, "minute");
-  const hours = Math.round(minutes / 60);
-  if (Math.abs(hours) < 24) return relative.format(hours, "hour");
-  const days = Math.round(hours / 24);
-  if (Math.abs(days) < 30) return relative.format(days, "day");
-  const date = new Date(ms).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
-  return `on ${date}`;
+/** Compact age for the right-hand column: 5m, 17h, 3d, then a date. */
+function shortAge(ms: number): string {
+  const minutes = Math.floor((Date.now() - ms) / 60_000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+  return shortDate.format(ms);
 }
 
-function Name({ worktree }: { worktree: WorktreeRow }) {
-  const verb = worktree.primary ? "main checkout, cloned" : "created";
+function Age({ worktree }: { worktree: WorktreeRow }) {
+  if (worktree.createdAt === null) return <span className="w-12 shrink-0" />;
+  const verb = worktree.primary ? "Cloned" : "Created";
   return (
-    <div className="flex min-w-0 items-baseline gap-2">
-      <span className="truncate text-sm font-medium" title={label(worktree)}>
-        {label(worktree)}
+    <time
+      dateTime={new Date(worktree.createdAt).toISOString()}
+      title={`${verb} ${new Date(worktree.createdAt).toLocaleString()}`}
+      className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground"
+    >
+      {shortAge(worktree.createdAt)}
+    </time>
+  );
+}
+
+/** The owner prefix ("sanku/") repeats on every row, so it recedes. */
+function BranchName({ worktree }: { worktree: WorktreeRow }) {
+  const slash = worktree.branch?.indexOf("/") ?? -1;
+  return (
+    <span className="flex min-w-0 items-baseline gap-2">
+      <span className="truncate text-sm" title={label(worktree)}>
+        {worktree.branch && slash > 0 ? (
+          <>
+            <span className="text-muted-foreground">
+              {worktree.branch.slice(0, slash + 1)}
+            </span>
+            {worktree.branch.slice(slash + 1)}
+          </>
+        ) : (
+          label(worktree)
+        )}
       </span>
-      {worktree.createdAt !== null ? (
-        <time
-          dateTime={new Date(worktree.createdAt).toISOString()}
-          title={new Date(worktree.createdAt).toLocaleString()}
-          className="shrink-0 text-xs text-muted-foreground"
-        >
-          {verb} {age(worktree.createdAt)}
-        </time>
-      ) : worktree.primary ? (
-        <span className="shrink-0 text-xs text-muted-foreground">
-          main checkout
+      {worktree.primary ? (
+        <span className="shrink-0 rounded border border-border px-1.5 text-[11px] leading-4 text-muted-foreground">
+          main
         </span>
       ) : null}
-    </div>
+    </span>
   );
 }
 
@@ -177,66 +222,54 @@ function RunningRow({
 }) {
   const navigate = useBbNavigate();
   const { pending, run } = useServerAction(projectId, worktree, onChanged);
-  const attach = `tmux attach -t ${worktree.session}`;
   return (
-    <li className="px-4 py-3">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <span className="relative flex size-2 shrink-0" aria-hidden>
+    <li className="px-4 py-3" title={displayPath(worktree.path)}>
+      <div className="flex items-center gap-3">
+        <span className="relative flex size-2 shrink-0" aria-label="Running">
           <span className="absolute inline-flex size-full rounded-full bg-emerald-500 opacity-60 motion-safe:animate-ping" />
           <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
         </span>
         <div className="min-w-0 flex-1">
-          <Name worktree={worktree} />
-          <p className="truncate font-mono text-xs text-muted-foreground">
+          <BranchName worktree={worktree} />
+          <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
             {worktree.lastLine ?? "Starting…"}
           </p>
         </div>
-        <div className="flex items-center gap-1">
-          {worktree.url ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => navigate.openUrl(worktree.url ?? "")}
-            >
-              <Icon name="ExternalLink" />
-              {worktree.url.replace(/^https?:\/\//, "")}
-            </Button>
-          ) : null}
+        {worktree.url ? (
           <Button
-            variant="ghost"
+            variant="link"
             size="sm"
-            aria-expanded={showLogs}
-            aria-pressed={showLogs}
-            onClick={onToggleLogs}
+            className="px-1 text-foreground"
+            onClick={() => navigate.openUrl(worktree.url ?? "")}
           >
-            <Icon name="ScrollText" />
-            Logs
+            {worktree.url.replace(/^https?:\/\//, "")}
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-8"
-            aria-label="Copy tmux attach command"
-            onClick={() => {
-              void navigator.clipboard.writeText(attach);
-              toast.success(`Copied ${attach}`);
-            }}
-          >
-            <Icon name="Copy" />
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={pending !== null}
-            onClick={() => run("stop")}
-          >
-            <Icon name="Square" />
-            {pending === "stop" ? "Stopping…" : "Stop"}
-          </Button>
-        </div>
+        ) : null}
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-expanded={showLogs}
+          aria-pressed={showLogs}
+          onClick={onToggleLogs}
+        >
+          Logs
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-muted-foreground"
+          disabled={pending !== null}
+          onClick={() => run("stop")}
+        >
+          {pending === "stop" ? "Stopping…" : "Stop"}
+        </Button>
       </div>
       {showLogs ? (
-        <LogView projectId={projectId} path={worktree.path} />
+        <LogView
+          projectId={projectId}
+          path={worktree.path}
+          session={worktree.session}
+        />
       ) : null}
     </li>
   );
@@ -253,25 +286,23 @@ function StoppedRow({
 }) {
   const { pending, run } = useServerAction(projectId, worktree, onStarted);
   return (
-    <li className="flex items-center gap-3 px-4 py-2">
-      <span
-        className="size-2 shrink-0 rounded-full border border-muted-foreground/40"
-        aria-hidden
-      />
+    <li
+      className="group flex h-10 items-center gap-3 pl-4 pr-2 hover:bg-state-hover"
+      title={displayPath(worktree.path)}
+    >
       <div className="min-w-0 flex-1">
-        <Name worktree={worktree} />
-        <p className="truncate text-xs text-muted-foreground">
-          {displayPath(worktree.path)}
-        </p>
+        <BranchName worktree={worktree} />
       </div>
+      <Age worktree={worktree} />
       <Button
         variant="ghost"
         size="sm"
+        className="w-20 justify-start text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-100 [@media(hover:none)]:opacity-100"
         disabled={pending !== null}
         onClick={() => run("start")}
       >
         <Icon name="Play" />
-        {pending === "start" ? "Starting…" : "Start dev"}
+        {pending === "start" ? "Starting" : "Start"}
       </Button>
     </li>
   );
@@ -382,6 +413,30 @@ function WorktreeList({
   );
 }
 
+/** bb's sidebar serves each project's icon; a 404 means none, so fall back
+ * to the project's initial. */
+function ProjectLogo({ project }: { project: Project }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <span
+        aria-hidden
+        className="flex size-4 shrink-0 items-center justify-center rounded-sm bg-muted text-[10px] font-medium uppercase text-muted-foreground"
+      >
+        {project.name.slice(0, 1)}
+      </span>
+    );
+  }
+  return (
+    <img
+      src={`/api/v1/plugins/bb-sidebar/http/project-icon?projectId=${encodeURIComponent(project.id)}`}
+      alt=""
+      className="size-4 shrink-0 rounded-sm"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
 const LAST_PROJECT_KEY = "bb-plugin-worktrees:last-project";
 
 // The selected project lives in the URL (/plugins/worktrees/worktrees/<id>),
@@ -423,7 +478,10 @@ function WorktreesPage({ subPath }: { subPath: string }) {
                 <SelectContent>
                   {projects.map((project) => (
                     <SelectItem key={project.id} value={project.id}>
-                      {project.name}
+                      <span className="flex items-center gap-2">
+                        <ProjectLogo project={project} />
+                        {project.name}
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
