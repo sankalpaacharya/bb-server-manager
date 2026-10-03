@@ -13,8 +13,8 @@ tmux session.
   if the server crashes.
 - **Logs** tails the session live inside the page.
 - The first `localhost:<port>` URL the server prints shows up as a link.
-- The terminal button copies `tmux attach -t <session>` so you can open the
-  same session in any terminal.
+- The logs panel shows `tmux attach -t <session>` with a copy button, so you
+  can open the same session in any terminal.
 - **Stop** sends Ctrl-C, then closes the session.
 
 Session names come from the worktree folder (`cops.submissions-fifo` becomes
