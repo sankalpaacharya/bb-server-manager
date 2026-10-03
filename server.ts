@@ -5,25 +5,25 @@ import { hostContract, worktreeSchema, type Worktree } from "./contract.js";
 
 const worktreeRowSchema = worktreeSchema.extend({
   session: z.string(),
+  primary: z.boolean(),
   running: z.boolean(),
   url: z.string().nullable(),
+  lastLine: z.string().nullable(),
 });
 export type WorktreeRow = z.infer<typeof worktreeRowSchema>;
-
-const projectRowSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  error: z.string().nullable(),
-  worktrees: z.array(worktreeRowSchema),
-});
-export type ProjectRow = z.infer<typeof projectRowSchema>;
 
 const target = z.object({ projectId: z.string(), path: z.string() });
 
 export const rpcContract = defineRpcContract({
-  overview: {
+  projects: {
     input: z.null(),
-    output: z.object({ projects: z.array(projectRowSchema) }),
+    output: z.object({
+      projects: z.array(z.object({ id: z.string(), name: z.string() })),
+    }),
+  },
+  worktrees: {
+    input: z.object({ projectId: z.string() }),
+    output: z.object({ worktrees: z.array(worktreeRowSchema) }),
   },
   start: { input: target, output: z.null() },
   stop: { input: target, output: z.null() },
@@ -85,15 +85,19 @@ export default async function plugin(bb: BbPluginApi) {
     return { hostId, path, session: sessionName(repoPath, path) };
   }
 
-  async function detectUrl(hostId: string, session: string) {
+  async function peek(hostId: string, session: string) {
     const capture = await host
       .call("capture", { session, lines: 2000 }, { hostId })
       .catch(() => null);
-    return capture?.text.match(URL_PATTERN)?.[0] ?? null;
+    const lines = capture?.text.split("\n").filter((line) => line.trim());
+    return {
+      url: capture?.text.match(URL_PATTERN)?.[0] ?? null,
+      lastLine: lines?.at(-1)?.trim() ?? null,
+    };
   }
 
-  async function projectRow(projectId: string): Promise<ProjectRow> {
-    const { project, hostId, repoPath } = await projectSource(projectId);
+  async function worktreeRows(projectId: string): Promise<WorktreeRow[]> {
+    const { hostId, repoPath } = await projectSource(projectId);
     const [worktrees, { sessions }] = await Promise.all([
       listWorktrees(hostId, repoPath),
       host.call("sessions", null, { hostId }),
@@ -106,38 +110,31 @@ export default async function plugin(bb: BbPluginApi) {
         return {
           ...worktree,
           session,
+          primary: worktree.path === repoPath,
           running: isRunning,
-          url: isRunning ? await detectUrl(hostId, session) : null,
+          ...(isRunning
+            ? await peek(hostId, session)
+            : { url: null, lastLine: null }),
         };
       }),
     );
     rows.sort(
       (a, b) =>
-        Number(b.path === repoPath) - Number(a.path === repoPath) ||
-        Number(b.running) - Number(a.running) ||
-        a.path.localeCompare(b.path),
+        Number(b.primary) - Number(a.primary) || a.path.localeCompare(b.path),
     );
-    return { id: project.id, name: project.name, error: null, worktrees: rows };
+    return rows;
   }
 
   bb.rpc.register(rpcContract, {
-    overview: async () => {
-      const projects = await bb.sdk.projects.list();
-      return {
-        projects: await Promise.all(
-          projects.map((project) =>
-            projectRow(project.id).catch(
-              (cause: unknown): ProjectRow => ({
-                id: project.id,
-                name: project.name,
-                error: cause instanceof Error ? cause.message : String(cause),
-                worktrees: [],
-              }),
-            ),
-          ),
-        ),
-      };
-    },
+    projects: async () => ({
+      projects: (await bb.sdk.projects.list()).map(({ id, name }) => ({
+        id,
+        name,
+      })),
+    }),
+    worktrees: async ({ projectId }) => ({
+      worktrees: await worktreeRows(projectId),
+    }),
     start: async ({ projectId, path }) => {
       const { hostId, session } = await resolve(projectId, path);
       const { devCommand } = await settings.get();

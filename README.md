@@ -1,9 +1,12 @@
 # bb-server-manager
 
-A bb plugin that adds a **Worktrees** page to the sidebar. For
-every bb project it lists the repo's git worktrees and lets you run each one's
-dev server in its own tmux session.
+A bb plugin that adds a **Worktrees** page to the sidebar. Pick a project from
+the dropdown to see its git worktrees and run each one's dev server in its own
+tmux session.
 
+- Worktrees are split into **Running** and **Stopped**. Each running server
+  shows its latest output line as it changes.
+- The filter box narrows the list by branch or folder name.
 - **Start dev** opens a detached tmux session in the worktree and types the dev
   command (default `pnpm dev`). The pane is a normal shell, so it stays open
   if the server crashes.
