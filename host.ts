@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk";
 import { hostContract, type Worktree } from "./contract.js";
@@ -14,8 +16,17 @@ async function run(file: string, args: string[], signal?: AbortSignal) {
   return stdout;
 }
 
-function parseWorktrees(porcelain: string): Worktree[] {
-  const worktrees: Worktree[] = [];
+/** `git worktree add` writes the worktree's `.git` file, so its birth time is
+ * when the worktree was created. Git itself keeps no such record. */
+async function createdAt(path: string): Promise<number | null> {
+  const { birthtimeMs } = await stat(join(path, ".git")).catch(() => ({
+    birthtimeMs: 0,
+  }));
+  return birthtimeMs > 0 ? birthtimeMs : null;
+}
+
+async function readWorktrees(porcelain: string): Promise<Worktree[]> {
+  const worktrees: Promise<Worktree>[] = [];
   for (const block of porcelain.split("\n\n")) {
     const fields = new Map<string, string>();
     for (const line of block.split("\n")) {
@@ -25,13 +36,16 @@ function parseWorktrees(porcelain: string): Worktree[] {
     }
     const path = fields.get("worktree");
     if (!path || fields.has("bare") || fields.has("prunable")) continue;
-    worktrees.push({
-      path,
-      branch: fields.get("branch")?.replace(/^refs\/heads\//, "") ?? null,
-      head: (fields.get("HEAD") ?? "").slice(0, 8),
-    });
+    worktrees.push(
+      createdAt(path).then((created) => ({
+        path,
+        branch: fields.get("branch")?.replace(/^refs\/heads\//, "") ?? null,
+        head: (fields.get("HEAD") ?? "").slice(0, 8),
+        createdAt: created,
+      })),
+    );
   }
-  return worktrees;
+  return Promise.all(worktrees);
 }
 
 const pane = (session: string) => `=${session}:`;
@@ -55,7 +69,7 @@ export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
     worktrees: async ({ repoPath }, { signal }) => ({
-      worktrees: parseWorktrees(
+      worktrees: await readWorktrees(
         await run(
           "git",
           ["-C", repoPath, "worktree", "list", "--porcelain"],

@@ -120,7 +120,9 @@ export default async function plugin(bb: BbPluginApi) {
     );
     rows.sort(
       (a, b) =>
-        Number(b.primary) - Number(a.primary) || a.path.localeCompare(b.path),
+        Number(b.primary) - Number(a.primary) ||
+        (b.createdAt ?? 0) - (a.createdAt ?? 0) ||
+        a.path.localeCompare(b.path),
     );
     return rows;
   }

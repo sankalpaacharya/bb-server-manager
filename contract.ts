@@ -5,6 +5,8 @@ export const worktreeSchema = z.object({
   path: z.string(),
   branch: z.string().nullable(),
   head: z.string(),
+  /** Epoch ms; null when the filesystem doesn't record creation times. */
+  createdAt: z.number().nullable(),
 });
 export type Worktree = z.infer<typeof worktreeSchema>;
 

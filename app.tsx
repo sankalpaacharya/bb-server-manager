@@ -120,11 +120,40 @@ function LogView({ projectId, path }: { projectId: string; path: string }) {
   );
 }
 
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+
+function age(ms: number): string {
+  const minutes = Math.round((ms - Date.now()) / 60_000);
+  if (minutes === 0) return "just now";
+  if (Math.abs(minutes) < 60) return relative.format(minutes, "minute");
+  const hours = Math.round(minutes / 60);
+  if (Math.abs(hours) < 24) return relative.format(hours, "hour");
+  const days = Math.round(hours / 24);
+  if (Math.abs(days) < 30) return relative.format(days, "day");
+  const date = new Date(ms).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return `on ${date}`;
+}
+
 function Name({ worktree }: { worktree: WorktreeRow }) {
+  const verb = worktree.primary ? "main checkout, cloned" : "created";
   return (
     <div className="flex min-w-0 items-baseline gap-2">
-      <span className="truncate text-sm font-medium">{label(worktree)}</span>
-      {worktree.primary ? (
+      <span className="truncate text-sm font-medium" title={label(worktree)}>
+        {label(worktree)}
+      </span>
+      {worktree.createdAt !== null ? (
+        <time
+          dateTime={new Date(worktree.createdAt).toISOString()}
+          title={new Date(worktree.createdAt).toLocaleString()}
+          className="shrink-0 text-xs text-muted-foreground"
+        >
+          {verb} {age(worktree.createdAt)}
+        </time>
+      ) : worktree.primary ? (
         <span className="shrink-0 text-xs text-muted-foreground">
           main checkout
         </span>
@@ -136,15 +165,18 @@ function Name({ worktree }: { worktree: WorktreeRow }) {
 function RunningRow({
   projectId,
   worktree,
+  showLogs,
+  onToggleLogs,
   onChanged,
 }: {
   projectId: string;
   worktree: WorktreeRow;
+  showLogs: boolean;
+  onToggleLogs: () => void;
   onChanged: () => void;
 }) {
   const navigate = useBbNavigate();
   const { pending, run } = useServerAction(projectId, worktree, onChanged);
-  const [showLogs, setShowLogs] = useState(false);
   const attach = `tmux attach -t ${worktree.session}`;
   return (
     <li className="px-4 py-3">
@@ -175,7 +207,7 @@ function RunningRow({
             size="sm"
             aria-expanded={showLogs}
             aria-pressed={showLogs}
-            onClick={() => setShowLogs((open) => !open)}
+            onClick={onToggleLogs}
           >
             <Icon name="ScrollText" />
             Logs
@@ -213,13 +245,13 @@ function RunningRow({
 function StoppedRow({
   projectId,
   worktree,
-  onChanged,
+  onStarted,
 }: {
   projectId: string;
   worktree: WorktreeRow;
-  onChanged: () => void;
+  onStarted: () => void;
 }) {
-  const { pending, run } = useServerAction(projectId, worktree, onChanged);
+  const { pending, run } = useServerAction(projectId, worktree, onStarted);
   return (
     <li className="flex items-center gap-3 px-4 py-2">
       <span
@@ -286,6 +318,14 @@ function WorktreeList({
   query: string;
 }) {
   const { worktrees, error, refetch } = useWorktrees(projectId);
+  const [openLogs, setOpenLogs] = useState<ReadonlySet<string>>(new Set());
+  const setLogsOpen = (path: string, open: boolean) =>
+    setOpenLogs((current) => {
+      const next = new Set(current);
+      if (open) next.add(path);
+      else next.delete(path);
+      return next;
+    });
   if (error) {
     return (
       <p role="alert" className="text-sm text-destructive">
@@ -314,6 +354,10 @@ function WorktreeList({
               key={worktree.path}
               projectId={projectId}
               worktree={worktree}
+              showLogs={openLogs.has(worktree.path)}
+              onToggleLogs={() =>
+                setLogsOpen(worktree.path, !openLogs.has(worktree.path))
+              }
               onChanged={refetch}
             />
           ))}
@@ -326,7 +370,10 @@ function WorktreeList({
               key={worktree.path}
               projectId={projectId}
               worktree={worktree}
-              onChanged={refetch}
+              onStarted={() => {
+                setLogsOpen(worktree.path, true);
+                refetch();
+              }}
             />
           ))}
         </Group>
@@ -335,14 +382,20 @@ function WorktreeList({
   );
 }
 
+const LAST_PROJECT_KEY = "bb-plugin-worktrees:last-project";
+
 // The selected project lives in the URL (/plugins/worktrees/worktrees/<id>),
-// so back/forward and reloads keep it.
+// so back/forward and reloads keep it; the sidebar entry reopens the last one.
 function WorktreesPage({ subPath }: { subPath: string }) {
   const navigate = useBbNavigate();
   const { projects, error } = useProjects();
   const [query, setQuery] = useState("");
+  const wanted = subPath || localStorage.getItem(LAST_PROJECT_KEY);
   const selected =
-    projects?.find((project) => project.id === subPath) ?? projects?.[0] ?? null;
+    projects?.find((project) => project.id === wanted) ?? projects?.[0] ?? null;
+  useEffect(() => {
+    if (selected) localStorage.setItem(LAST_PROJECT_KEY, selected.id);
+  }, [selected]);
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto box-border w-full max-w-3xl space-y-5 px-4 pb-8 pt-3 md:px-5 md:pt-4">
